@@ -1,11 +1,11 @@
+import hashlib
 import re
 from pathlib import Path
 import pymupdf4llm
 from langchain_core.documents import Document
 from dotenv import load_dotenv
-from langchain_text_splitters import RecursiveCharacterTextSplitter,MarkdownHeaderTextSplitter
-
-
+from langchain_text_splitters import RecursiveCharacterTextSplitter, MarkdownHeaderTextSplitter
+from ingestion.chunk_enrichment import enrich_static, enrich_contextual
 
 load_dotenv()
 
@@ -14,8 +14,9 @@ CHUNK_OVERLAP = 100
 PDF_FOLDERS = ['docs/time_series']
 FILE_KEYS = ("title", "file_name", "file_path", "folder_name", "folder_path", "relative_path")
 KEEP = ("title", "author", "creationDate", "page_count", "page_number")
-MIN_CHARS = 50  
-    
+MIN_CHARS = 50
+ENRICHMENT_MODE = "static"   # "static" | "contextual"
+
 # ============================================================
 # STEP 1: LOAD
 # ============================================================
@@ -25,7 +26,6 @@ def pdf_loader_pymupdf4llm(folders: list[str]) -> list[dict]:
     for folder in folders:
         root = Path(folder)
         for pdf_path in sorted(root.rglob("*.pdf")):
-            # One dict per page: {"metadata": {...}, "text": "markdown...", ...}
             md_pages = pymupdf4llm.to_markdown(str(pdf_path), page_chunks=True, show_progress=False)
 
             title = md_pages[0]["metadata"].get("title") or pdf_path.stem
@@ -39,7 +39,6 @@ def pdf_loader_pymupdf4llm(folders: list[str]) -> list[dict]:
                 "relative_path": str(pdf_path.relative_to(root)),
             }
 
-            # Wrap each page as a LangChain Document (PyPDFLoader did this for us)
             pages = []
             for p in md_pages:
                 meta = {k: p["metadata"][k] for k in KEEP if p["metadata"].get(k) not in (None, "")}
@@ -57,13 +56,17 @@ def pdf_loader_pymupdf4llm(folders: list[str]) -> list[dict]:
 
 
 # ============================================================
-# STEP 2: CHUNKING BY SIZE
+# STEP 2: CHUNKING
 # pymupdf4llm converts PDF → markdown text (with # headings, **bold**, <sup> tags)
 #   ↓
 # chunk_by_heading()   splits on the # markers → sections with messy metadata
 #   ↓
 # clean_section()      strips the markdown/HTML noise from the heading labels
-# ============================================================    
+#   ↓
+# chunk_by_size_header() re-attaches file metadata, size-splits, drops tiny scraps
+#   ↓
+# enrich_chunks()      adds context prefix, chunk ID, and LLM-extracted metadata
+# ============================================================
 
 
 # ============================================================
@@ -72,20 +75,20 @@ def pdf_loader_pymupdf4llm(folders: list[str]) -> list[dict]:
 
 header_splitter = MarkdownHeaderTextSplitter(
     headers_to_split_on=[("#", "h1"), ("##", "h2"), ("###", "h3"), ("####", "h4"), ("#####", "h5")],
-    strip_headers=False,     # keep the heading line in the text too
+    strip_headers=False,
 )
 
-def chunk_by_heading(doc:dict) -> list[Document]:
+def chunk_by_heading(doc: dict) -> list[Document]:
     sections = header_splitter.split_text(doc['full_text'])
-    
     print(f"\n[2a] {doc['file_name']}: {len(sections)} sections")
     for s in sections[:8]:
         print(s.metadata, f"({len(s.page_content):,} chars)")
     return sections
 
-# =================================================================
-# STEP 2b: CLEAN UP HEADINGS AND LABEL SECTIONS OF HEADING CHUNKING
-# =================================================================
+
+# ============================================================
+# STEP 2b: CLEAN UP HEADINGS AND LABEL SECTIONS
+# ============================================================
 
 def clean_heading(text: str) -> str:
     """Strip markdown/HTML formatting: **bold**, _italic_, <sup>…</sup>."""
@@ -94,16 +97,15 @@ def clean_heading(text: str) -> str:
     return " ".join(text.split())
 
 def clean_section(sections: list[Document]) -> list[Document]:
-    """Replace h1..h5 with the nearest heading only (heading LEVELS in PDFs are unreliable)."""
+    """Replace h1..h5 with the nearest heading only."""
     for s in sections:
-        # header splitter adds keys shallow -> deep, so the last value is the nearest heading
         nearest = list(s.metadata.values())[-1] if s.metadata else ""
         s.metadata = {"section": clean_heading(nearest)}
-
     print(f"\n[2b] {len(sections)} labelled sections")
     for s in sections[:8]:
         print(s.metadata, f"({len(s.page_content):,} chars)")
     return sections
+
 
 # ============================================================
 # STEP 2c: SPLIT BY SIZE (CHUNK_SIZE, CHUNK_OVERLAP)
@@ -111,32 +113,27 @@ def clean_section(sections: list[Document]) -> list[Document]:
 
 size_splitter = RecursiveCharacterTextSplitter(chunk_size=CHUNK_SIZE, chunk_overlap=CHUNK_OVERLAP)
 
-def chunk_by_size(doc:dict) -> list[Document]:
+def chunk_by_size(doc: dict) -> list[Document]:
     chunks = size_splitter.split_documents(doc["pages"])
-
     print(f"\n[2c] {doc['file_name']}: {len(doc['pages'])} pages -> {len(chunks)} chunks")
     for c in chunks[:3]:
         print(f"\n--- page {c.metadata['page_number']} ---")
         print(c.page_content)
     return chunks
 
+
 # ============================================================
 # STEP 2d: CHUNK BY SIZE WITH SECTION LABELS
 # ============================================================
 
-def chunk_by_size_header(doc:dict) -> list[Document]:
-    # get sections first
+def chunk_by_size_header(doc: dict) -> list[Document]:
     clean_sections = clean_section(chunk_by_heading(doc))
-    
-    # put the file metadata back on each section
-    file_meta = {k:doc[k] for k in FILE_KEYS}
+
+    file_meta = {k: doc[k] for k in FILE_KEYS}
     for sec in clean_sections:
         sec.metadata.update(file_meta)
-    
-    # 3. split by size -- each chunk inherits its section's metadata
+
     section_chunks = size_splitter.split_documents(clean_sections)
-    
-    # 4. drop tiny scraps
     final_chunks = [c for c in section_chunks if len(c.page_content.strip()) >= MIN_CHARS]
 
     print(f"\n[2d] {doc['file_name']}: {len(clean_sections)} sections -> {len(final_chunks)} chunks")
@@ -144,15 +141,28 @@ def chunk_by_size_header(doc:dict) -> list[Document]:
 
 
 # ============================================================
+# STEP 2e: ENRICH CHUNKS WITH LLM METADATA + CONTEXT PREFIX
+# Takes the heading+size chunks and stamps each one with:
+#   - deterministic chunk ID
+#   - context prefix prepended to the embedding text
+#   - all LLM-extracted document metadata
+# Output is a list of plain dicts ready for Qdrant upsert.
+# ============================================================
+
+
+
+# ============================================================
 # MAIN
-# ============================================================  
+# ============================================================
 
 if __name__ == "__main__":
-    
+    from ingestion.extractor import extract_document_metadata
+
     docs = pdf_loader_pymupdf4llm(PDF_FOLDERS)
     print(f"\nTotal: {len(docs)} PDFs")
     doc = docs[0]
-     # --- 2a: heading split ---
+
+    # --- 2a: heading split ---
     sections = chunk_by_heading(doc)
 
     # --- 2b: clean section labels ---
@@ -161,18 +171,28 @@ if __name__ == "__main__":
     # --- 2c: size split only ---
     size_chunks = chunk_by_size(doc)
 
-    # --- 2d: heading + size (the one you'll actually use) ---
+    # --- 2d: heading + size ---
     chunks = chunk_by_size_header(doc)
 
+    # --- 2e: enrich ---
+    meta = extract_document_metadata(doc)      # <-- add this
+
+    if ENRICHMENT_MODE == "contextual":
+        from langchain_openai import ChatOpenAI
+        llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
+        enriched = enrich_contextual(chunks, doc, meta, llm)
+    else:
+        enriched = enrich_static(chunks, doc, meta)
+
     # size check
-    sizes = [len(c.page_content) for c in chunks]
+    sizes = [len(c["text_for_display"]) for c in enriched]
     print(f"\nChunk sizes: min {min(sizes)}, max {max(sizes)}, avg {sum(sizes) // len(sizes)}")
 
-    # sample chunks from start, middle, end
-    for i in (0, len(chunks) // 2, -1):
-        c = chunks[i]
-        print(f"\n--- chunk {i} | section: '{c.metadata.get('section')}' ---")
-        print(c.page_content[:300])
+    # sample chunks
+    for i in (0, len(enriched) // 2, -1):
+        c = enriched[i]
+        print(f"\n--- chunk {i} | section: '{c['section']}' | doc_type: '{c['doc_type']}' ---")
+        print(c["text_for_display"][:300])
+        print(f"  embedding prefix: {c['text_for_embedding'][:80]}...")
 
-    # full metadata of one chunk
-    print("\nSample metadata:", chunks[len(chunks) // 2].metadata)
+    print("\nSample enriched chunk:", {k: v for k, v in enriched[len(enriched) // 2].items() if k != "text_for_embedding"})

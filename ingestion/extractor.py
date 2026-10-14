@@ -59,7 +59,7 @@ Return only the JSON object. No explanation, no markdown fences."""
     if result.startswith("```"):
         result = result.split("```")[1]
         if result.startswith("json"):
-            result = result[4:]
+            result = result.removeprefix("json").strip()
         result = result.strip()
 
     try:
@@ -80,6 +80,7 @@ def _fallback(doc: dict) -> dict:
         "parent_document_id": None,
         "summary": None,
         "key_financial_terms": {},
+         "_fallback": True,   # <-- flag
     }
 
 
